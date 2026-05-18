@@ -1,0 +1,1644 @@
+---
+title: "EPIB 674 Final Project"
+author: "Tida Sonetirot and Dylan Boone"
+date: "2026-04-29"
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r setup, include=FALSE}
+#setwd("~/EPIB674-UMD-git")
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "~/EPIB674-UMD-git")
+```
+```{r Load the environment}
+library(tidymodels)
+library(tidyverse)
+library(nhanesA)
+library(naniar)
+library(mice)
+library(skimr)
+library(janitor)
+library(ggplot2)
+library(xgboost)
+library(vip)
+library(ranger)
+```
+# Dataset Description
+
+## Background
+
+Type 2 diabetes (T2D) is a major chronic disease burden in the United States, affecting 29.1 million Americans and costing an estimated $413 billion annually. A further 115.2 million adults have prediabetes, making early and accurate identification of at-risk individuals a critical public health priority. T2D is largely preventable and manageable through lifestyle interventions, and most of its key risk factors — obesity, elevated blood pressure, sedentary behavior, and family history — are routinely measurable.
+
+This project uses data from the **National Health and Nutrition Examination Survey (NHANES) 2017–2018 cycle (NHANES_J)**, a nationally representative survey conducted by the Centers for Disease Control and Prevention. NHANES combines in-person physical examinations, laboratory tests, and self-reported questionnaires on approximately 9,000 Americans per two-year cycle. The 2017–2018 cycle was selected because it was the most recent pre-COVID cycle with complete in-person examination data as physical exams were suspended in 2020 due to the pandemic.
+
+We merged **16 NHANES modules** (downloaded in `.XPT` format from the CDC website) covering demographics, body measurements, blood pressure, physical activity, smoking, alcohol use, lipid panels, diet, medical and family history, disability, healthcare access, and depression screening. All modules are linked by a common participant identifier (`SEQN`). The raw dataset required substantial cleaning before it was analysis-ready, as detailed in the preprocessing section below.
+
+## Problem Definition
+
+This project is a **binary classification** task. The outcome variable is diabetes status derived from survey question DIQ010 ("Has a doctor ever told you that you have diabetes?"). Participants who answered "Yes" are the positive class; those who answered "No" are the negative class. Participants coded as "Borderline" (code 3) were excluded because pre-diabetes is a clinically distinct condition with different management implications, and including it would create a noisy mixed label that the model cannot reliably learn. The goal is to train machine learning models to predict confirmed Type 2 diabetes status from routinely available survey and examination variables, and to compare model performance with particular attention to class imbalance (~10% prevalence).
+
+## NHANES Modules Used
+  DEMO_J   Demographics   Age, sex, race, education, income, marital status  
+  DIQ_J   Diabetes (Outcome)   DIQ010: ever told you have diabetes  
+  BMX_J   Body Measures   Weight, height, BMI, waist, hip, arm measurements  
+  BPX_J   Blood Pressure Exam   Averaged systolic & diastolic measurements  
+  BPQ_J   BP Questionnaire   History of high blood pressure, high cholesterol  
+  PAQ_J   Physical Activity   Vigorous/moderate work and recreation, sedentary time  
+  SMQ_J   Smoking   Smoking history, cigarettes per day  
+  ALQ_J   Alcohol Use   Drinking frequency and quantity  
+  HDL/TCHOL/TRIGLY   Lipoproteins & Cholesterol   HDL, total cholesterol, triglycerides (fasting subsample)  
+  DBQ_J   Diet Behavior   Self-rated diet quality, fast food frequency  
+  MCQ_J   Medical History   Family history of diabetes, heart disease, stroke  
+  DLQ_J   Disability   Difficulty hearing, seeing, walking, concentrating  
+  HUQ_J   Healthcare Access   Routine care, hospital visits, mental health visits  
+  DPQ_J   Depression (PHQ-9)   Composite PHQ-9 depression score  
+# Preprocessing Steps
+## Overview of Cleaning Decisions
+
+Raw NHANES data requires several systematic cleaning steps before it is suitable for modeling. The four main decisions made in this project were:
+**Value recoding:** NHANES uses numeric codes (7, 77, 9, 99, etc.) to represent "Refused" and "Don't Know" responses. These codes were scanned across every module and recoded to `NA` before analysis to prevent them from being treated as legitimate numeric values.
+**Non-informative variable removal:** Administrative variables such as survey weights, interview language flags, and household composition counts were dropped. Pediatric age variables were also removed, as the focus of this project is adult Type 2 diabetes.
+**Blood pressure averaging:** The BPX module recorded up to four blood pressure readings per participant. Readings 1–3 were averaged into `avg_systolic` and `avg_diastolic`. The fourth reading was dropped due to high missingness.
+**Data leakage prevention:** Most variables in the DIQ (diabetes) module — such as insulin use and blood glucose monitoring — were only asked to participants already known to have diabetes. Including these variables as predictors would directly leak the outcome into the feature set. All DIQ variables except the outcome (`DIQ010`) were therefore dropped.
+
+All 16 modules were joined on `SEQN` (participant ID) using `reduce()` combined with `left_join()'.
+
+```{r DEMO_J cleaning}
+## Module-Level Cleaning
+nhanesTables('DEMO', year = 2017)
+demo <- nhanes('DEMO_J')
+skim(demo)
+
+#the code book is uploaded on the CDC website, it lists the code and a description of the variable
+demo_clean <- demo %>% select(-SDDSRVYR, -RIDSTATR, -RIDEXMON, -SDMVPSU, -SDMVSTRA, -RIDAGEMN, -RIDEXAGM, -DMQADFC, -DMDEDUC3, -DMDYRSUS)
+
+#the following variables were dropped before model building because they are non informative/non predictive administrative variables. two additional variable were dropped, RIDAGEMN and RIDEXAGM were dropped because they are pediatric age variables and are focus is type 2 diabetes.
+
+head(demo_clean)
+#the NHANES data set sometimes uses things other than NA to designate missingness, we need to scan the variables to find these and determine if they are legitimate, if they are not then we need to covert them to NA
+
+map_df(demo_clean, ~sum(. %in% c(7, 77, 777, 7777, 9, 99, 999, 9999), na.rm = TRUE)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "count") %>%
+  filter(count > 0)
+#checking the code book on the CDC site confirms that these are legit ages as 80 is the maximum value entered for this variable. 
+```
+```{r DIQ_J cleaning}
+library(haven)
+diq <- read_xpt("data/DIQ_J.XPT")
+skim(diq)
+#the original plan was to read in the diabetes data module in the same way as the DEMO_J module, but there was an error due to nhanes package. DIQ_J was downloaded manually from the CDC website.
+
+diq_clean <- diq %>% select(SEQN, DIQ010) %>%
+  mutate(DIQ010 = na_if(DIQ010, 7),
+         DIQ010 = na_if(DIQ010, 9))
+#the only variables worth keeping are the outcome variable, DIQ010 and SEQN which will be used to join the data sets later. The reason the rest of the variables were dropped was due a data leakage problem. most variables were questions asked to only people who already had diabetes so they cannot be predictors. 
+#We will need to decide what to do with the borderline, code 3 people later, after the merge. 
+```
+
+```{r BMX_J cleaning}
+bmx <- read_xpt("data/BMX_J.XPT")
+skim(bmx)
+
+bmx_clean <- bmx %>% select(SEQN, BMXWT, BMXHT, BMXBMI, BMXWAIST, BMXLEG, BMXARML, BMXARMC, BMXHIP)
+
+#all of the comment variables were dropped because tey are non informative. Also dropped BMXRECUM because it is a for children. Lastly, dropped variables that were entirely missing. 
+
+#no sweeping for erroneous entries was needed on this module because all variables are continuous and missing is already NA.
+```
+
+```{r BPX_J cleaning}
+bpx <- read_xpt("data/BPX_J.xpt")
+skim(bpx)
+
+bpx_clean <- bpx %>% select(-PEASCCT1, -BPAARM, -BPACSZ, -BPAEN1, -BPAEN2, -BPAEN3, -BPAEN4)
+
+#dropped the non informative variables from the data set.
+
+#will average the first three systolic and diastolic variables, and drop the fourth reading variable since there is high missingness.
+
+bpx_clean <- bpx_clean %>% mutate(avg_systolic =
+  rowMeans(select(., BPXSY1, BPXSY2, BPXSY3), na.rm = TRUE),
+  avg_diastolic = rowMeans(select(., BPXDI1, BPXDI2, BPXDI3), na.rm = TRUE)
+) %>% select(-BPXSY1, -BPXSY2, -BPXSY3, -BPXDI1, -BPXDI2, -BPXDI3)
+
+skim(bpx_clean)
+```
+```{r BPQ_J cleaning}
+bpq <- read_xpt("data/BPQ_J.xpt")
+skim(bpq)
+
+#there are no variables that need to be dropped. only change is to recode 2 levels of the age variable to be NA
+
+bpq_clean <- bpq %>% 
+  select(SEQN, BPQ020, BPQ080) %>%
+  mutate(
+    BPQ020 = na_if(BPQ020, 7), BPQ020 = na_if(BPQ020, 9),
+    BPQ080 = na_if(BPQ080, 7), BPQ080 = na_if(BPQ080, 9)
+  )
+```
+
+```{r PAQ_J cleaning}
+paq <- read_xpt("data/PAQ_J.xpt")
+skim(paq)
+
+#there are several variable levels that will need to be recoded to NA.
+paq_clean <- paq %>% 
+  select(SEQN, PAQ605, PAQ620, PAQ635, PAQ650, PAQ665, PAD680) %>%
+  mutate(
+    PAQ605 = na_if(PAQ605, 7), PAQ605 = na_if(PAQ605, 9),
+    PAQ620 = na_if(PAQ620, 7), PAQ620 = na_if(PAQ620, 9),
+    PAQ635 = na_if(PAQ635, 7), PAQ635 = na_if(PAQ635, 9),
+    PAQ650 = na_if(PAQ650, 7), PAQ650 = na_if(PAQ650, 9),
+    PAQ665 = na_if(PAQ665, 7), PAQ665 = na_if(PAQ665, 9),
+    PAD680 = na_if(PAD680, 7777), PAD680 = na_if(PAD680, 9999)
+  )
+```
+
+```{r SMQ_J cleaning}
+smq <- read_xpt("data/SMQ_J.xpt")
+skim(smq)
+
+smq_clean <- smq %>% select(-SMDUPCA, -SMD093, -SMD100BR, -SMD100TR, -SMD100NI, -SMD100CO, -SMD630, -SMQ661, -SMQ665A, -SMQ665B, -SMQ665C, -SMQ665D, -SMAQUEX2)
+#dropping these variables because there are either too many levels or they are not likely to be informative
+
+#recode variables to NA that have refused or did not know.
+
+smq_clean <- smq_clean %>% mutate(
+  SMD030 = na_if(SMD030, 777),
+  SMD030 = na_if(SMD030, 999),
+  SMQ050Q = na_if(SMQ050Q, 77777),
+  SMQ050Q = na_if(SMQ050Q, 99999),
+  SMD057 = na_if(SMD057, 777),
+  SMD057 = na_if(SMD057, 999),
+  SMQ078 = na_if(SMQ078, 77),
+  SMQ078 = na_if(SMQ078, 99),
+  SMD641 = na_if(SMD641, 77),
+  SMD641 = na_if(SMD641, 99),
+  SMD650 = na_if(SMD650, 777),
+  SMD650 = na_if(SMD650, 999),
+  SMQ621 = na_if(SMQ621, 77),
+  SMQ621 = na_if(SMQ621, 99),
+  SMQ848 = na_if(SMQ848, 777),
+  SMQ848 = na_if(SMQ848, 999),
+  SMQ852Q = na_if(SMQ852Q, 7777),
+  SMQ852Q = na_if(SMQ852Q, 9999),
+  SMQ895 = na_if(SMQ895, 77),
+  SMQ895 = na_if(SMQ895, 99),
+  SMQ905 = na_if(SMQ905, 77),
+  SMQ905 = na_if(SMQ905, 99),
+  SMQ915 = na_if(SMQ915, 77),
+  SMQ915 = na_if(SMQ915, 99)
+)
+```
+
+```{r ALQ_J cleaning}
+alq <- read_xpt("data/ALQ_J.xpt")
+skim(alq)
+alq_clean <- alq %>% mutate(
+  ALQ111 = na_if(ALQ111, 7), ALQ111 = na_if(ALQ111, 9),
+  ALQ121 = na_if(ALQ121, 77), ALQ121 = na_if(ALQ121, 99),
+  ALQ130 = na_if(ALQ130, 777), ALQ130 = na_if(ALQ130, 999),
+  ALQ142 = na_if(ALQ142, 77), ALQ142 = na_if(ALQ142, 99),
+  ALQ151 = na_if(ALQ151, 7), ALQ151 = na_if(ALQ151, 9),
+  ALQ170 = na_if(ALQ170, 777), ALQ170 = na_if(ALQ170, 999),
+  ALQ270 = na_if(ALQ270, 777), ALQ270 = na_if(ALQ270, 999),
+  ALQ280 = na_if(ALQ280, 777), ALQ280 = na_if(ALQ280, 999),
+  ALQ290 = na_if(ALQ290, 777), ALQ290 = na_if(ALQ290, 999)
+)
+```
+
+```{r Insert Lipid variables}
+hdl <- read_xpt("data/HDL_J.xpt")
+tchol <- read_xpt("data/TCHOL_J.xpt")
+trigly <- read_xpt("data/TRIGLY_J.xpt")
+
+hdl_clean    <- hdl    %>% select(SEQN, LBDHDD) 
+tchol_clean  <- tchol  %>% select(SEQN, LBXTC) # Total cholesterol 
+trigly_clean <- trigly %>% select(SEQN, LBXTR, LBDLDL)  # Triglycerides
+```
+
+
+```{r DBQ_J cleaning - diet}
+dbq <- read_xpt("data/DBQ_J.xpt")
+skim(dbq)
+
+# Diet behavior. Kept high-signal variable like how healthy is your diet, then (self-rated), meals not home-prepared, fast food frequency. Drop child-feeding 
+
+dbq_clean <- dbq %>% select(SEQN, DBQ700, DBD895, DBD900, DBD905, DBD910) %>%
+  mutate(
+    DBQ700 = na_if(DBQ700, 7), DBQ700 = na_if(DBQ700, 9),
+    DBD895 = na_if(DBD895, 7777), DBD895 = na_if(DBD895, 9999),
+    DBD900 = na_if(DBD900, 7777), DBD900 = na_if(DBD900, 9999),
+    DBD905 = na_if(DBD905, 7777), DBD905 = na_if(DBD905, 9999),
+    DBD910 = na_if(DBD910, 7777), DBD910 = na_if(DBD910, 9999)
+  )
+```
+```{r DLQ_J cleaning}
+dlq <- read_xpt("data/DLQ_J.xpt")
+skim(dlq)
+
+#Disability questionnaire. Variables capture difficulty with hearing, vision, memory, walking/climbing, dressing/bathing, errands. Reasonable predictors of T2D - chronic disability often correlates with sedentary lifestyle which is a known risk factor.
+
+dlq_clean <- dlq %>% select(SEQN, DLQ010, DLQ020, DLQ040, DLQ050, DLQ060, DLQ080) %>%
+  mutate(
+    DLQ010 = na_if(DLQ010, 7), DLQ010 = na_if(DLQ010, 9),  #serious difficulty hearing
+    DLQ020 = na_if(DLQ020, 7), DLQ020 = na_if(DLQ020, 9),  #serious difficulty seeing
+    DLQ040 = na_if(DLQ040, 7), DLQ040 = na_if(DLQ040, 9),  #difficulty concentrating/remembering
+    DLQ050 = na_if(DLQ050, 7), DLQ050 = na_if(DLQ050, 9),  #difficulty walking/climbing stairs
+    DLQ060 = na_if(DLQ060, 7), DLQ060 = na_if(DLQ060, 9),  #difficulty dressing/bathing
+    DLQ080 = na_if(DLQ080, 7), DLQ080 = na_if(DLQ080, 9)   #difficulty doing errands alone
+  )
+```
+
+```{r HUQ_J cleaning}
+huq <- read_xpt("data/HUQ_J.xpt")
+skim(huq)
+
+#Hospital utilization & access to care. Healthcare access matters for diabetes - people without regular care are less likely to be diagnosed even if diabetic, and general health rating is a known global predictor.
+
+huq_clean <- huq %>% select(SEQN, HUQ010, HUQ030, HUQ051, HUQ071, HUQ090) %>%
+  mutate(
+    HUQ010 = na_if(HUQ010, 7), HUQ010 = na_if(HUQ010, 9),  #general health condition (1=excellent...5=poor)
+    HUQ030 = na_if(HUQ030, 7), HUQ030 = na_if(HUQ030, 9),  #routine place to go for healthcare
+    HUQ051 = na_if(HUQ051, 77), HUQ051 = na_if(HUQ051, 99), ## times received healthcare past year
+    HUQ071 = na_if(HUQ071, 7), HUQ071 = na_if(HUQ071, 9),   #overnight hospital patient last year
+    HUQ090 = na_if(HUQ090, 7), HUQ090 = na_if(HUQ090, 9)    #seen mental health professional
+  )
+```
+
+```{r DPQ_J cleaning - depression PHQ-9}
+dpq <- read_xpt("data/DPQ_J.xpt")
+skim(dpq)
+
+#Depression screener (PHQ-9). The PHQ-9 has 9 items each scored 0-3, summed for a total severity score (0-27). Depression has a bidirectional relationship with T2D - depressed patients are at higher risk for diabetes, and diabetics are at higher risk for depression.
+#We compute the composite score rather than keeping all 9 items because the score is the validated clinical measure and is more interpretable than 9 correlated items.
+
+dpq_clean <- dpq %>% 
+  mutate(across(starts_with("DPQ"), ~ na_if(.x, 7))) %>%
+  mutate(across(starts_with("DPQ"), ~ na_if(.x, 9))) %>%
+  mutate(SEQN = dpq$SEQN,
+         phq9_total = rowSums(across(c(DPQ010, DPQ020, DPQ030, DPQ040, DPQ050,
+                                        DPQ060, DPQ070, DPQ080, DPQ090)), 
+                              na.rm = FALSE)) %>%
+  select(SEQN, phq9_total)
+
+#Why na.rm = FALSE: if any of the 9 items is missing, the composite score is invalid.
+#PHQ-9 interpretation: 0-4 minimal, 5-9 mild, 10-14 moderate, 15-19 moderately severe, 20-27 severe.
+```
+
+```{r MCQ_J cleaning - medical conditions/family history}
+mcq <- read_xpt("data/MCQ_J.xpt")
+skim(mcq)
+
+# MCQ has many variables. We want the family history of diabetes (MCQ300C) 
+# which is one of the strongest non-lab predictors of T2D, plus a few other cardio metabolic conditions that often co-occur with diabetes.
+
+mcq_clean <- mcq %>% select(SEQN, 
+                            MCQ300C,   # Close relative had diabetes
+                            MCQ160B,   # Ever told had congestive heart failure
+                            MCQ160C,   # Ever told had coronary heart disease
+                            MCQ160E,   # Ever told had heart attack
+                            MCQ160F,   # Ever told had stroke
+                            MCQ160L) %>%   # Ever told you had liver condition
+  mutate(across(everything(), ~ na_if(.x, 7))) %>%
+  mutate(across(everything(), ~ na_if(.x, 9))) %>%
+  mutate(SEQN = mcq$SEQN)  # restore SEQN 
+```
+
+```{r all modules together}
+library(corrplot)
+
+#reduce() with left_join chains all the joins. SEQN is the participant ID that links the NHANES module. Starting with diq_clean as the "base" because it has our outcome - left_join which keeps all rows from the left table and brings in matching rows from the right.
+
+nhanes_full <- list(diq_clean, demo_clean, bmx_clean, bpx_clean, bpq_clean,
+                    paq_clean, smq_clean, alq_clean, hdl_clean, tchol_clean,
+                    trigly_clean, dbq_clean, mcq_clean,
+                    dlq_clean, huq_clean, dpq_clean) %>%
+  reduce(left_join, by = "SEQN")
+
+dim(nhanes_full)
+```
+## Outcome Variable and Class Imbalance
+
+The outcome variable `DIQ010` was recoded into a binary factor (`yes`/`no`). Borderline cases (coded= 3) were excluded for the reasons described above. The final dataset has approximately 10% diabetes prevalence, creating a class imbalance problem: a naive classifier that predicts "no" for every observation would achieve ~90% accuracy, making standard accuracy a misleading primary metric. All subsequent modeling decisions were made for consideration of the imbalance. 
+```{r Diabetes outcome, drop borderline and encode binary variable}
+#DIQ010: 1 = Yes diabetic, 2 = No, 3 = Borderline, NA = unknown. Dropped borderline (code 3) and missing for a clean binary outcome.
+
+nhanes_full <- nhanes_full %>%
+  filter(DIQ010 %in% c(1, 2)) %>%
+  mutate(diabetes = factor(if_else(DIQ010 == 1, "yes", "no"),
+                           levels = c("no", "yes"))) %>%
+  select(-DIQ010)
+table(nhanes_full$diabetes)
+prop.table(table(nhanes_full$diabetes))
+```
+```{r Code binary variables to 0/1}
+#NHANES codes binary as 1 = Yes, 2 = No
+nhanes_full <- nhanes_full %>% mutate(
+  RIAGENDR = if_else(RIAGENDR == 1, 1, 0),    #1 = male, 0 = female
+  BPQ020   = if_else(BPQ020 == 1, 1, 0),      #ever told high BP
+  BPQ080   = if_else(BPQ080 == 1, 1, 0),      #told high cholesterol
+  MCQ300C  = if_else(MCQ300C == 1, 1, 0),     #family hx diabetes
+  MCQ160B  = if_else(MCQ160B == 1, 1, 0),     #told CHF
+  MCQ160C  = if_else(MCQ160C == 1, 1, 0),     #told CHD
+  MCQ160E  = if_else(MCQ160E == 1, 1, 0),     #told heart attack
+  MCQ160F  = if_else(MCQ160F == 1, 1, 0),     #told stroke
+  MCQ160L  = if_else(MCQ160L == 1, 1, 0),     #told liver condition
+  ALQ111   = if_else(ALQ111 == 1, 1, 0),      #ever had a drink
+  PAQ605   = if_else(PAQ605 == 1, 1, 0),      #vigorous work activity
+  PAQ620   = if_else(PAQ620 == 1, 1, 0),      #moderate work activity
+  PAQ635   = if_else(PAQ635 == 1, 1, 0),      #walk or bike to places
+  PAQ650   = if_else(PAQ650 == 1, 1, 0),      #vigorous recreation
+  PAQ665   = if_else(PAQ665 == 1, 1, 0),      #moderate recreation
+  SMQ020   = if_else(SMQ020 == 1, 1, 0),      #smoked 100+ cigs
+  DLQ010   = if_else(DLQ010 == 1, 1, 0),      #serious difficulty hearing
+  DLQ020   = if_else(DLQ020 == 1, 1, 0),      #serious difficulty seeing
+  DLQ040   = if_else(DLQ040 == 1, 1, 0),      #difficulty concentrating
+  DLQ050   = if_else(DLQ050 == 1, 1, 0),      #difficulty walking/stairs
+  DLQ060   = if_else(DLQ060 == 1, 1, 0),      #difficulty dressing/bathing
+  DLQ080   = if_else(DLQ080 == 1, 1, 0),      #difficulty errands
+  HUQ030   = if_else(HUQ030 == 1, 1, 0),      #routine place for healthcare
+  HUQ071   = if_else(HUQ071 == 1, 1, 0),      #overnight hospital last year
+  HUQ090   = if_else(HUQ090 == 1, 1, 0)       #seen mental health professional
+)
+
+dim(nhanes_full)
+colSums(is.na(nhanes_full)) %>% sort(decreasing = TRUE) %>% head(20)
+table(nhanes_full$diabetes)
+```
+
+## Variable Reduction
+
+After merging the 16 modules, the dataset contained over 80 columns. Therefore, a two-stage missingness filter was applied. First, any variable with more than 50% missing data was dropped (with an exception for the fasting lipid variables HDL and triglycerides, which were missing for approximately 50% of participants because they required a fasting blood draw from a subsample, which were retained due to their strong clinical relevance). Second, any variable with more than 40% missingness after EDA review was also dropped.
+
+Correlation analysis identified highly correlated predictors (|r| > 0.7–0.9): `BMXWT`, `BMXARMC`, `BMXWAIST`, and `BMXHIP` were all strongly correlated with BMI and were dropped; `LBXTC` (total cholesterol) was correlated with LDL/HDL and removed. Near-constant variables (`HUQ071`, which was 91% zero, and `DMDCITZN`, which was 89% a single category) were also dropped. Administrative and duplicate demographic variables were removed. The final dataset retained approximately 55 predictor variables for modeling.
+
+```{r Drop high-missingness columns}
+#After joining all modules, several variables had extreme missingness (>50%) due to NHANES skip patterns. 
+
+#Calculate missingness percentage per column
+miss_pct <- nhanes_full %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+#Keep variables with <50% missing. Lipids will be ~50% missing because fasting bloodwork was a subsample - we keep those because they're clinically critical for diabetes prediction.
+vars_to_keep <- miss_pct %>%
+  filter(pct_missing < 50 | variable %in% c("LBDHDD", "LBXTR", "LBDLDL")) %>%
+  pull(variable)
+
+#Always keep SEQN and the outcome regardless
+vars_to_keep <- union(vars_to_keep, c("SEQN", "diabetes"))
+
+nhanes_full <- nhanes_full %>% select(any_of(vars_to_keep))
+
+cat("Variables remaining after missingness filter:", ncol(nhanes_full), "\n")
+cat("Expecting roughly 60-80\n")
+
+#Show the top remaining missingness to confirm we didn't miss anything obvious
+nhanes_full %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing)) %>%
+  head(15)
+```
+
+```{r check binary encoding}
+#quick check of some of the binary vars encoded that may have been dropped for high missingness. Confirm numbers retained and that levels make sense.
+binary_check_vars <- c("RIAGENDR", "BPQ020", "BPQ030", "BPQ080", 
+                       "MCQ300C", "MCQ160B", "MCQ160C", "MCQ160E", "MCQ160F", "MCQ160L",
+                       "ALQ111", "ALQ151", "PAQ605", "PAQ620", "PAQ635", "PAQ650", "PAQ665",
+                       "SMQ020")
+
+#Filter to ones still in the dataset
+present_binary <- intersect(binary_check_vars, names(nhanes_full))
+
+nhanes_full %>%
+  select(all_of(present_binary)) %>%
+  summarise(across(everything(), ~ paste(sort(unique(.x[!is.na(.x)])), collapse = ","))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "values") %>%
+  print()
+
+#The nhanesA package returned RIAGENDR as a labeled factor ("Male"/"Female") instead of raw codes (1/2). Our if_else upstream silently miscoded everyone to 0. Fixed by re-pulling RIAGENDR from the original demo and recoding properly.
+nhanes_full <- nhanes_full %>%
+  select(-RIAGENDR) %>%
+  left_join(
+    demo %>% 
+      select(SEQN, RIAGENDR) %>%
+      mutate(RIAGENDR = case_when(
+        as.character(RIAGENDR) == "Male"   ~ 1,
+        as.character(RIAGENDR) == "Female" ~ 0,
+        TRUE ~ NA_real_
+      )),
+    by = "SEQN"
+  )
+table(nhanes_full$RIAGENDR, useNA = "always")
+dim(nhanes_full)
+names(nhanes_full)
+```
+# Exploratory Analyses
+
+## Class Balance
+
+The bar chart below confirmed the class imbalance where approximately 90% of participants reported no diabetes diagnosis and 10% reported a confirmed diagnosis. This distribution underscores why accuracy was misleading and why ROC-AUC and PR-AUC were selected as primary evaluation metrics. Stratified sampling was then used in the train/test split and in all cross-validation folds to preserve this ratio across all data partitions.
+```{r EDA - class balance bar plot}
+ggplot(nhanes_full, aes(x = diabetes, fill = diabetes)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(title = "Bar Plot of Diabetes Status",
+       x = "Diabetes Status", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+#There is moderate class imbalance with around 10%. Will use stratified sampling for splits and CV, and use ROC-AUC + kappa as primary metrics rather than accuracy alone.
+```
+
+```{r EDA - correlation plot}
+#Pull all numerics, compute pairwise correlations, look for anything >= 0.9 to drop. Highly correlated predictors hurt linear models (multicollinearity inflates standard errors) and make tree variable importance arbitrary - the tree picks one of two correlated vars and the other looks unimportant even though it's identical.
+
+nhanes_numeric <- nhanes_full %>% select(where(is.numeric)) %>% select(-SEQN)
+correlation_matrix <- cor(nhanes_numeric, use = "pairwise.complete.obs")
+
+corrplot(correlation_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.4,
+         tl.cex = 0.6, tl.col = "black")
+
+nhanes_full <- nhanes_full %>% select(-any_of(c("BMXWT", "BMXARMC", "BMXWAIST", "BMXHIP", "LBXTC")))
+
+nhanes_numeric <- nhanes_full %>% select(where(is.numeric)) %>% select(-SEQN)
+correlation_matrix <- cor(nhanes_numeric, use = "pairwise.complete.obs")
+corrplot(correlation_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.5,
+         tl.cex = 0.6, tl.col = "black")
+
+high_cor_pairs <- correlation_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "correlation") %>%
+  filter(var1 < var2,                          #avoid duplicates (var1-var2 vs var2-var1)
+         abs(correlation) > 0.7) %>%
+  arrange(desc(abs(correlation)))
+
+print(high_cor_pairs)
+```
+## Correlation Structure
+
+The correlation plot above guided the variable removal. As shown, there were several body measurement variables that were highly correlated with BMI (weight, waist circumference, hip circumference, arm circumference), as well as some cholesterol variables. 
+## Distributions by Diabetes Status
+
+The box plots below show numeric predictor distributions stratified by diabetes outcome. Consistent with clinical literature, participants with diabetes tend to be older, have higher BMI, higher triglycerides, higher blood pressure, and lower HDL cholesterol compared to non-diabetic participants. These patterns confirm that the selected features carry meaningful signal for the prediction task.
+```{r EDA - boxplots of numeric predictors by outcome}
+nhanes_full %>%
+  filter(!is.na(diabetes)) %>%
+  select(where(is.numeric), diabetes) %>%
+  select(-SEQN) %>%
+  pivot_longer(cols = -diabetes, names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = diabetes, y = Value, fill = diabetes)) +
+  geom_boxplot() +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Box Plots by Diabetes Status",
+       x = "Diabetes Status", y = "Value") +
+  theme(axis.text.x = element_text(size = 8),
+        legend.position = "none")
+#Expect to see: diabetics shifted toward higher age, BMI, triglycerides, blood pressure; lower HDL.
+```
+## Missingness Patterns
+
+NHANES uses skip patterns, meaning that not every participant had answered each question. The missingness plot below shows the extent of missing data by variable. Lipid variables (HDL, triglycerides) are missing for approximately 50% of participants because they required a fasting blood draw. Physical activity and smoking variables show moderate missingness due to questionnaire skip logic. The plot revealed that approximately 3,000 participants were simultaneously missing across multiple variables. 
+```{r EDA - missingness}
+gg_miss_var(nhanes_full, show_pct = TRUE) +
+  labs(title = "Missingness by variable")
+
+nhanes_full <- nhanes_full %>% select(-any_of("LBDLDL"))
+#Lipids will be ~50% missing because fasting bloodwork was a subsample. PAQ vars have moderate missingness from skip patterns. Dropped LDL
+
+#Additional missingness threshold - drop anything >40% missing 
+miss_pct <- nhanes_full %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+vars_to_keep <- miss_pct %>%
+  filter(pct_missing < 40 | variable %in% c("LBDHDD", "LBXTR")) %>%
+  pull(variable)
+vars_to_keep <- union(vars_to_keep, c("SEQN", "diabetes"))
+
+nhanes_full <- nhanes_full %>% select(any_of(vars_to_keep))
+
+cat("Variables remaining after missingness filter:", ncol(nhanes_full), "\n")
+
+#Confirm what's left and what got dropped
+nhanes_full %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing)) %>%
+  head(20)
+
+dim(nhanes_full)
+names(nhanes_full)
+```
+
+```{r Additional cleaning}
+nhanes_full <- nhanes_full %>% select(-any_of(c(
+  "WTINT2YR", "WTMEC2YR",                        # survey weights
+  "SIALANG", "SIAPROXY", "SIAINTRP",             # interview language 
+  "FIALANG", "FIAPROXY", "FIAINTRP",
+  "MIALANG", "MIAPROXY", "MIAINTRP",
+  "DMDHHSZA", "DMDHHSZB", "DMDHHSZE",            # household comp counts
+  "DMDHHSIZ",                                     # duplicate with DMDFMSIZ
+  "RIDRETH1",                                     # similar with RIDRETH3 
+  "INDHHIN2",                                     # similar with INDFMIN2 + INDFMPIR
+  "DMDHRGND", "DMDHRAGZ", "DMDHREDZ", "DMDHRMAZ"  # head-of-household demos - keep participant-level only
+)))
+
+cat("After additional cleanup:", ncol(nhanes_full), "\n")
+dim(nhanes_full)
+names(nhanes_full)
+```
+
+## Missing Data Diagnosis
+Before imputing, we decided to test  whether the missingness mechanism was compatible with MICE. MICE is helpful when data are Missing at Random (MAR) meaning missingness can be predicted by other observed variables but not when data are MNAR. We tested three representative high-missingness variables using logistic regression, with missingness as the binary outcome and a set of complete-or-near-complete variables as predictors:
+**LBXTR (Triglycerides):** No predictors were statistically significant, consistent with Missing Completely at Random (MCAR). This aligned with expectation because triglyceride measurement was based on random assignment to the fasting subsample.
+**PAD680 (Sedentary Time):** Age, sex, BMI, and blood pressure history were significant predictors of missingness, indicating MAR.
+**MCQ300C (Family History of Diabetes):** Significant predictors found, also consistent with MAR.
+
+MAR supports the use of MICE, as the imputation can leverage the observed variables to estimate missing values. We acknowledge this is an assumption that cannot be fully verified, but the results support its plausibility.
+```{r Missingness pattern diagnosis}
+#missigness patterns across all variables
+vis_miss(nhanes_full, warn_large_data = FALSE)
+
+#upset plot shows a the combination of missingness across all variables
+gg_miss_upset(nhanes_full, nsets = 10)
+#the upset plot reveals that approximately 3000 observations are missing across multiple variables at the same time, suggesting that these participants completed the interview but not the physical examination, I searched google to see if this is a known pattern with the NHANES data and confirmed that this is a consistent phenomena. The clustering of missingness across variables seems to support the pattern being MAR rather than MNAR, this is a good sign as mice needs the data to be MAR to work. we will check the patterns further using logistic regression. 
+
+#create a missigness response indicator for the key variables from the upset plot
+
+nhanes_full<- nhanes_full %>%
+  mutate(missing_trig = as.numeric(is.na(LBXTR)),
+         missing_mcq300c = as.numeric(is.na(MCQ300C)),
+         missing_pad680 = as.numeric(is.na(PAD680)))
+
+# testing whether the missingness is predicted by completed or nearly completed variables in the data set.
+
+glm(missing_trig ~ RIDAGEYR + RIAGENDR + BMXBMI + 
+                   BPQ020, data = nhanes_full, family = binomial) %>% summary()
+
+glm(missing_pad680 ~ RIDAGEYR + RIAGENDR + BMXBMI + 
+                   BPQ020, data = nhanes_full, family = binomial) %>% summary()
+
+glm(missing_mcq300c ~ RIDAGEYR + RIAGENDR + BMXBMI + 
+                   BPQ020, data = nhanes_full, family = binomial) %>% summary()
+
+#these three variables were chosen because they had the highest missingness patterns in the data set, and represented the worst case scenario, if we tested these three we can then be confident at the rest of the variables where there are missing rows follow in kind. we ran first created a response variable for each of the variables that had missingness, 1 if observed and 0 if missing. then we picked a few variables that were complete or nearly complete to serve as predictors. if the p values are not significant this means that the pattern is MCAR, the best possible scenario. if the p values are significant then the interpretation is either MAR or MNAR, we have to then think about the variable itself and its relationship to the outcome. It is also worth mentioning that the three variables wwe selected as the outcome represent three types of variables, trig is a lab value, family history is a questionnaire, and sedentary activity is a behavioral variable. the result of the first model was consistent with MCAR as all predictors were not significant. the next two models had significant predictors which is consistent with MAR, the full write up will be explained in the presentation. we acknowledge that there is always a limitation when diagnosing missing patterns, but we are confident in the soundness of our methodology. In published epidemiological research it is standard practice to test missingness patterns using the variables that have the highest percentage missing. 
+```
+
+## Multiple Imputation by Chained Equations (MICE)
+MICE fills in missing values by building a separate regression model for each incomplete variable, using all other variables as predictors and iterating through the variables in chains. We produced `m = 5` complete datasets, used `maxit = 5` iterations per chain, and selected Predictive Mean Matching (PMM) as the imputation method that is well-suited to mixed numeric and categorical data. The training and test sets were imputed separately to prevent data leakage between splits. After imputation, factor levels were aligned between the training and test datasets using training-set levels to ensure consistent encoding.
+
+The initial MICE run produced 1,250 logged events, indicating some imputation instability. The diagnosis revealed two root causes being the near-constant variables (`HUQ071` and `DMDCITZN`) that created almost singular imputation models and were dropped, and several demographic factor variables (`DMDEDUC2`, `DMDMARTL`, `DMQMILIZ`, `DMDBORN4`, `INDFMIN2`) were retained ("Refused" and "Don't Know") as factor levels with very few observations, causing collinear dummy variables in the imputation models. These levels were recoded to `NA` before rerunning MICE. After these fixes, the logged events dropped from 1,250 to 25.
+```{r setting up mice for imputations}
+summary(nhanes_full$diabetes)
+
+set.seed(123)
+
+nhanes_split <- initial_split(nhanes_full, prop = 0.8, strata = diabetes)
+
+nhanes_train <- training(nhanes_split)
+nhanes_test <- testing(nhanes_split)
+
+dim(nhanes_train)
+dim(nhanes_test)
+
+#nhanes_train_mice <- nhanes_train %>% select(-SEQN)
+
+#imputed_train <- mice(nhanes_train_mice, m = 5, maxit = 5, method = "pmm", seed = 123, printFlag = FALSE)
+
+#the was a warning that there were 1300 logged events. checking using a convergence plot
+#plot(imputed_train)
+
+#there are a few things worth noting as we look at the convergence plots.
+
+#straight line or single line convergence plot variables, these variables likely are close to being constants
+
+table(nhanes_train$HUQ071, useNA = "always")
+#nearly constant. should probably drop, with only 3 missing rows there is also little predictive power
+table(nhanes_train$DMDCITZN, useNA = "always")
+#same problem with this variable, can drop this one too
+table(nhanes_train$DBD895, useNA = "always")
+#this variable is okay, we just need to change the 5555 to NA
+nhanes_train <- nhanes_train %>% select(-HUQ071, -DMDCITZN, -BPXML1) %>%
+  mutate(DBD895 = na_if(DBD895, 5555))
+
+nhanes_test <- nhanes_test %>% select(-HUQ071, -DMDCITZN, -BPXML1) %>%
+  mutate(DBD895 = na_if(DBD895,5555))
+#dropped two variables and recoded 5555 to NA
+
+nhanes_train_mice <- nhanes_train %>% select(-SEQN, -missing_trig, -missing_mcq300c, -missing_pad680)
+#one issue was we forgot to drop the missing indicator variable from the data set. 
+
+#imputed_train <- mice(nhanes_train_mice, m = 5, maxit = 5, method = "pmm", seed = 123, printFlag = TRUE)
+
+nhanes_train %>% count(DMDEDUC2)
+nhanes_train %>% count(DMQMILIZ)
+nhanes_train %>% count(DMDBORN4)
+
+#check if there are other factor variables that are causing problems. 
+
+nhanes_train_mice %>% select(where(is.factor)) %>%
+  names()
+
+nhanes_train_mice %>% count(DMDMARTL)
+nhanes_train_mice %>% count(INDFMIN2)
+nhanes_train_mice %>% count(RIDRETH3)
+nhanes_train_mice %>% count(DMDFMSIZ)
+
+nhanes_train_mice <- nhanes_train_mice %>%
+  mutate(
+    DMDEDUC2 = na_if(as.character(DMDEDUC2), "Refused"),
+    DMDEDUC2 = na_if(DMDEDUC2, "Don't know"),
+    DMDEDUC2 = factor(DMDEDUC2),
+    
+    DMQMILIZ = na_if(as.character(DMQMILIZ), "Don't know"),
+    DMQMILIZ = factor(DMQMILIZ),
+    
+    DMDBORN4 = na_if(as.character(DMDBORN4), "Refused"),
+    DMDBORN4 = na_if(DMDBORN4, "Don't know"),
+    DMDBORN4 = factor(DMDBORN4),
+    
+    DMDMARTL = na_if(as.character(DMDMARTL), "Refused"),
+    DMDMARTL = factor(DMDMARTL),
+    
+    INDFMIN2 = na_if(as.character(INDFMIN2), "Refused"),
+    INDFMIN2 = na_if(INDFMIN2, "Don't know"),
+    INDFMIN2 = factor(INDFMIN2)
+  )
+
+#imputed_train <- mice(nhanes_train_mice, m = 5, maxit = 5, method = "pmm", seed = 123, printFlag = TRUE)
+#number of logged events reduce to 25 which is acceptable. 
+
+# MICE Convergence Issues and Fixes:
+# The initial MICE run produced 1,250 logged events indicating imputation 
+# instability. Diagnosis revealed two root causes:
+#
+# 1. Near-constant variables: HUQ071 (overnight hospitalization, 91% zero) 
+#    and DMDCITZN (citizenship, 89% one category) were dropped as they 
+#    provided little predictive value and caused convergence issues.
+#
+# 2. Labeled factor variables: Several demographic variables (DMDEDUC2, 
+#    DMDMARTL, DMQMILIZ, DMDBORN4, INDFMIN2) were returned as labeled 
+#    factors by the nhanesA package, retaining "Refused" and "Don't know" 
+#    as explicit factor levels with very few observations. MICE created 
+#    dummy variables for these near-empty categories causing collinearity.
+#    These levels were recoded to NA before rerunning MICE.
+#
+# After applying these fixes, logged events reduced from 1,250 to 25,
+# indicating stable imputation. Convergence plots confirmed good chain 
+# mixing across all variables.
+
+#plot(imputed_train)
+
+#sum(is.na(nhanes_train$BPXML1))
+
+# %>% count(BPXML1)
+#going to drop this variable because it is cuff size, we thought we already dropped this one.
+
+#nhanes_train_mice <- nhanes_train_mice %>% 
+  #select(-BPXML1)
+
+#nhanes_test <- nhanes_test %>% 
+  #select(-BPXML1)
+
+imputed_train <- mice(nhanes_train_mice, m = 5, maxit = 5, method = "pmm", seed = 123, printFlag = TRUE)
+
+plot(imputed_train)
+```
+```{r Extract completed datasets and model fitting}
+#extract all 5 completed datasets
+completed_train <- complete(imputed_train, action = "all")
+
+dim(completed_train[[1]])
+sum(is.na(completed_train[[1]]))
+#confirm that the dataset is as it should be and there are no missing rows, meaning that mice has done its job
+
+#prepare the test data set in the same way as the training set
+# Prepare test set the same way as training
+#nhanes_test_mice <- nhanes_test %>% 
+  #select(-SEQN) %>%
+  #mutate(
+    #DMDEDUC2 = na_if(as.character(DMDEDUC2), "Refused"),
+    #DMDEDUC2 = na_if(DMDEDUC2, "Don't know"),
+    #DMDEDUC2 = factor(DMDEDUC2),
+    #DMDMARTL = na_if(as.character(DMDMARTL), "Refused"),
+    #DMDMARTL = factor(DMDMARTL),
+    #DMQMILIZ = na_if(as.character(DMQMILIZ), "Don't know"),
+    #DMQMILIZ = factor(DMQMILIZ),
+    #DMDBORN4 = na_if(as.character(DMDBORN4), "Refused"),
+    #DMDBORN4 = na_if(DMDBORN4, "Don't know"),
+    #DMDBORN4 = factor(DMDBORN4),
+    #INDFMIN2 = na_if(as.character(INDFMIN2), "Refused"),
+    #INDFMIN2 = na_if(INDFMIN2, "Don't know"),
+    #INDFMIN2 = factor(INDFMIN2)
+  #)
+
+# Impute test set
+#imputed_test <- mice(nhanes_test_mice, m = 5, maxit = 5,
+                    # method = "pmm", seed = 123, #printFlag = FALSE)
+#there were 190 events when imputing the testing set, this is still acceptable, likely due to the dataset being smaller than the training
+
+#plot(imputed_test)
+
+#sum(is.na(nhanes_test_mice$DLQ010))
+#nhanes_test %>% count(DLQ010)
+#was a stright line, confirmed this was because there was only 1 missing value
+
+#completed_test <- complete(imputed_test, action = "all")
+
+#dim(completed_test[[1]])
+#sum(is.na(completed_test[[1]]))
+
+#everything here was commented out because we later run the imputation on the testing set with the dropped variables. 
+```
+
+
+```{r Extract completed datasets and prepare test set}
+completed_train <- complete(imputed_train, action = "all")
+
+dim(completed_train[[1]])
+sum(is.na(completed_train[[1]]))
+#Prepare test set with th column drops as training. Without these drops the test set ends up with 58 columns vs training's 55 or else models will break on prediction:
+# - SEQN (ID, not a predictor)
+# - missing_trig, missing_mcq300c, missing_pad680 (diagnostic indicators we already used)
+# - BPXML1 (BP cuff size; was dropped from nhanes_test upstream)
+#
+#Plus the same labeled-factor recoding (Refused / Don't know to NA) so factor levels match training
+
+nhanes_test_mice <- nhanes_test %>% 
+  select(-SEQN, -missing_trig, -missing_mcq300c, -missing_pad680) %>%
+  mutate(
+    DMDEDUC2 = na_if(as.character(DMDEDUC2), "Refused"),
+    DMDEDUC2 = na_if(DMDEDUC2, "Don't know"),
+    DMDEDUC2 = factor(DMDEDUC2),
+    DMDMARTL = na_if(as.character(DMDMARTL), "Refused"),
+    DMDMARTL = factor(DMDMARTL),
+    DMQMILIZ = na_if(as.character(DMQMILIZ), "Don't know"),
+    DMQMILIZ = factor(DMQMILIZ),
+    DMDBORN4 = na_if(as.character(DMDBORN4), "Refused"),
+    DMDBORN4 = na_if(DMDBORN4, "Don't know"),
+    DMDBORN4 = factor(DMDBORN4),
+    INDFMIN2 = na_if(as.character(INDFMIN2), "Refused"),
+    INDFMIN2 = na_if(INDFMIN2, "Don't know"),
+    INDFMIN2 = factor(INDFMIN2)
+  )
+
+#Impute test set 
+imputed_test <- mice(nhanes_test_mice, m = 5, maxit = 5,
+                     method = "pmm", seed = 123, printFlag = FALSE)
+#190 logged events when imputing the test set - acceptable, smaller dataset means slightly less stable estimation but the convergence plot was clean
+
+plot(imputed_test)
+
+sum(is.na(nhanes_test_mice$DLQ010))
+
+completed_test <- complete(imputed_test, action = "all")
+
+#checks - dimensions and column names should now match between train and test
+cat("Train dim:", dim(completed_train[[1]]), "\n")
+cat("Test dim: ", dim(completed_test[[1]]),  "\n")
+cat("Test NAs:", sum(is.na(completed_test[[1]])), "\n")
+identical(sort(names(completed_train[[1]])), sort(names(completed_test[[1]])))
+```
+
+```{r modeling datasets from MICE}
+#Pull imputation as the working dataset for modeling. 
+
+diabetes_train <- completed_train[[1]]
+diabetes_test  <- completed_test[[1]]
+
+#checks
+cat("Train dim:", dim(diabetes_train), "\n")
+cat("Test dim: ", dim(diabetes_test),  "\n")
+cat("Train NAs:", sum(is.na(diabetes_train)), 
+    " | Test NAs:", sum(is.na(diabetes_test)), "\n")
+
+#Class balance check across train/test
+prop.table(table(diabetes_train$diabetes))
+prop.table(table(diabetes_test$diabetes))
+```
+
+```{r Match factor levels between train and test}
+#After independent MICE on each set, factor levels could differ. We force test to use training's levels so step_dummy() in the recipe produces the same columns.
+#If test has a level not in train, that observation becomes NA after re-leveling.
+
+factor_vars <- diabetes_train %>% select(where(is.factor)) %>% names()
+factor_vars <- setdiff(factor_vars, "diabetes") 
+
+for (v in factor_vars) {
+  diabetes_test[[v]] <- factor(diabetes_test[[v]], levels = levels(diabetes_train[[v]]))
+}
+
+cat("Test NAs after re-leveling:", sum(is.na(diabetes_test)), "\n")
+```
+```{r Fixing NAs in NMQMILIZ}
+test_na_cols <- diabetes_test %>% 
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_na") %>%
+  filter(n_na > 0)
+print(test_na_cols)
+
+#Helper: mode of a factor in training data
+mode_fct <- function(x) {
+  tbl <- table(x)
+  factor(names(tbl)[which.max(tbl)], levels = levels(x))
+}
+
+#Replace NAs with training mode for each affected column
+for (v in test_na_cols$var) {
+  train_mode <- mode_fct(diabetes_train[[v]])
+  diabetes_test[[v]][is.na(diabetes_test[[v]])] <- train_mode
+}
+
+cat("Test NAs after fix:", sum(is.na(diabetes_test)), "\n")
+```
+# Explanation of Chosen Algorithms
+## Train/Test Split and Cross-Validation
+The full dataset (~8,468 observations after excluding borderline cases and those with missing outcomes) was split 80/20 into training (~6,774 observations) and test (~1,694 observations) sets using stratified sampling (strata = diabetes) to preserve the ~10% diabetes prevalence in both partitions. Five-fold stratified cross-validation was used on the training set for hyperparameter tuning. A fixed seed (set.seed(674)) was set before every tune_grid() call for reproducibility.
+```{r CV folds}
+#5-fold stratified cross-validation. Stratification keeps the ~10% diabetes prevalence balanced across folds.
+set.seed(674)
+cv_folds <- vfold_cv(diabetes_train, v = 5, strata = diabetes)
+```
+
+## Preprocessing Recipe
+A tidymodels `recipe()` pipeline was applied identically to the training data, CV folds, and test set. The recipe was `prep()` on training data only and then `bake()`' onto held-out folds and the test set separately, which prevented any information from the test set from influencing preprocessing decisions. The three steps were:
+1) `step_zv()` to remove zero-variance predictors
+2) `step_normalize()` to standardize all numeric predictors to mean = 0, sd = 1, which is required for distance-sensitive and scale-sensitive models (LASSO, KNN, LDA/QDA)
+3) `step_dummy()` to convert categorical variables to binary dummy columns, with `one_hot = FALSE` to drop the reference level.
+```{r LASSO recipe}
+#Recipe = preprocessing pipeline applied identically to training, CV folds, and test data.
+
+diabetes_recipe <- recipe(diabetes ~ ., data = diabetes_train) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+#check
+recipe_check <- diabetes_recipe %>% prep() %>% bake(new_data = NULL)
+cat("matrix dimensions after preprocessing:", dim(recipe_check), "\n")
+```
+## LASSO Logistic Regression — Feature Selection and Classifier
+LASSO (Least Absolute Shrinkage and Selection Operator) was the first model fit and served as a classifier and as a feature selection tool for all downstream models. LASSO adds an L1 penalty to the logistic regression loss function that forces small, unimportant coefficients exactly to zero, effectively performing automatic variable selection. A grid of 30 λ values from 10⁻⁴ to 10⁰ was evaluatedthrough 5-fold CV, with the best selected by ROC-AUC. Setting `mixture = 1` specifies pure LASSO (vs. ridge or elastic net). LASSO was chosen for feature selection because it reduces dimensionality, which allowed downstream models to train on a smaller, less correlated feature set. Additionally, it produced a consistent feature set that enables fair comparison across all seven models. The LASSO-selected variables were mapped back to the original column names and used to build a reduced training and test dataset for all subsequent models.
+```{r LASSO tuning}
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lasso_workflow <- workflow() %>%
+  add_recipe(diabetes_recipe) %>%
+  add_model(lasso_spec)
+
+lasso_grid <- grid_regular(penalty(range = c(-4, 0)), levels = 30)
+
+set.seed(674)
+lasso_tuning <- tune_grid(
+  lasso_workflow,
+  resamples = cv_folds,
+  grid = lasso_grid,
+  metrics = metric_set(roc_auc, accuracy, kap, sensitivity, specificity)
+)
+
+autoplot(lasso_tuning) + labs(title = "LASSO tuning")
+
+best_lasso <- select_best(lasso_tuning, metric = "roc_auc")
+print(best_lasso)
+
+#Pull LASSO-selected variables and check which ones survived
+final_lasso <- lasso_workflow %>%
+  finalize_workflow(best_lasso) %>%
+  fit(diabetes_train)
+
+lasso_coefs <- final_lasso %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(estimate != 0, term != "(Intercept)") %>%
+  arrange(desc(abs(estimate)))
+
+print(lasso_coefs, n = 25)
+cat("Number of variables selected by LASSO:", nrow(lasso_coefs), "\n")
+
+lasso_coefs %>%
+  slice_head(n = 20) %>%
+  mutate(direction = if_else(estimate > 0, "Increases risk", "Decreases risk")) %>%
+  ggplot(aes(x = reorder(term, abs(estimate)), y = estimate, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Increases risk" = "red", "Decreases risk" = "blue")) +
+  labs(title = "Top 20 LASSO-selected predictors",
+       subtitle = "Standardized coefficients - magnitude = relative importance",
+       x = NULL, y = "Standardized coefficient", fill = NULL) +
+  theme_minimal()
+
+#Strip dummy suffixes to get back to ORIGINAL column names
+original_vars <- lasso_coefs %>%
+  pull(term) %>%
+  str_remove("_[^_]+$") %>%
+  unique()
+
+original_vars <- intersect(original_vars, names(diabetes_train))
+cat("Original variables retained from LASSO:", length(original_vars), "\n")
+print(original_vars)
+
+#Build reduced datasets
+diabetes_train_red <- diabetes_train %>% select(diabetes, all_of(original_vars))
+diabetes_test_red  <- diabetes_test  %>% select(diabetes, all_of(original_vars))
+
+#Reduced recipe
+reduced_recipe <- recipe(diabetes ~ ., data = diabetes_train_red) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+#CV folds on reduced data
+set.seed(674)
+cv_folds_red <- vfold_cv(diabetes_train_red, v = 5, strata = diabetes)
+
+#Shared metrics and control for downstream models
+model_metrics <- metric_set(roc_auc, accuracy, kap, sensitivity, specificity)
+ctrl <- control_grid(save_pred = TRUE, verbose = FALSE)
+
+print(original_vars)
+```
+
+```{r LASSO evaluation on testing set}
+#lasso evaluation on test set
+lasso_preds <- final_lasso %>% 
+  predict(diabetes_test, type = "prob") %>%
+  bind_cols(diabetes_test %>% select(diabetes))
+
+roc_auc(lasso_preds, truth = diabetes, .pred_yes, event_level = "second")
+#high AUC 0.94 
+
+pr_auc(lasso_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.661
+
+lasso_preds_class <- final_lasso %>%
+  predict(diabetes_test) %>%
+  bind_cols(diabetes_test %>% select(diabetes))
+
+conf_mat(lasso_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(lasso_preds_class, truth = diabetes, estimate = .pred_class)
+
+sensitivity(lasso_preds_class, truth = diabetes, estimate = .pred_class,  event_level = "second")
+
+specificity(lasso_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+```
+## K-Nearest Neighbors (KNN)
+KNN classifies each new observation by finding the k closest training points using Euclidean distance and taking the majority of those neighbors. The number of neighbors *k* was tuned from 5 to 75 to find the best setting. Because KNN uses distance to measure similarity, all the variables must be scaled to the same range first. If not, the variables would be measured on larger scales which would unfairly dominate the results.
+```{r KNN}
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_wf <- workflow() %>%
+  add_recipe(reduced_recipe) %>%
+  add_model(knn_spec)
+
+knn_grid <- tibble(neighbors = seq(5, 75, length.out = 15) %>% round())
+
+set.seed(674)
+knn_tuning <- tune_grid(
+  knn_wf,
+  resamples = cv_folds_red,
+  grid = knn_grid,
+  metrics = model_metrics,
+  control = ctrl
+)
+
+autoplot(knn_tuning) + labs(title = "KNN tuning")
+best_knn <- select_best(knn_tuning, metric = "roc_auc")
+print(best_knn)
+```
+
+```{r knn evaluation on testing data}
+final_knn <- knn_wf %>% 
+  finalize_workflow(best_knn) %>%
+  fit(diabetes_train_red)
+
+knn_preds <- final_knn %>%
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+roc_auc(knn_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.885
+
+pr_auc(knn_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.456
+
+knn_preds_class <- final_knn %>%
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(knn_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(knn_preds_class, truth = diabetes, estimate = .pred_class)
+
+sensitivity(knn_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.034
+
+specificity(knn_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#auc is high, though not as high as the lasso and boosting model. the specificity is perfect, the sensitivity is terrible however. essentially the model cannot distinguish diabetes. knn struggles with class imbalances more than other models.   
+```
+## Linear and Quadratic Discriminant Analysis (LDA / QDA)
+LDA and QDA are classifiers that model the distribution of predictors within each class and use Bayes' theorem to assign class membership. LDA assumes a shared covariance matrix across classes and finds the linear decision boundary that maximizes between-class separation relative to within-class variance. QDA relaxes this assumption, allowing each class its own covariance matrix and increases flexibility but requires more estimated parameters. Both require no hyperparameter tuning as they were evaluated directly through 5-fold cross-validation using `fit_resamples()`. They serve as strong parametric baselines and are fast to fit, making them useful reference points for model comparisons.
+```{r LDA/QDA}
+library(discrim)
+
+lda_spec <- discrim_linear() %>% set_engine("MASS") %>% set_mode("classification")
+qda_spec <- discrim_quad()   %>% set_engine("MASS") %>% set_mode("classification")
+
+lda_wf <- workflow() %>% add_recipe(reduced_recipe) %>% add_model(lda_spec)
+qda_wf <- workflow() %>% add_recipe(reduced_recipe) %>% add_model(qda_spec)
+
+set.seed(674)
+lda_res <- fit_resamples(lda_wf, resamples = cv_folds_red,
+                         metrics = model_metrics,
+                         control = control_resamples(save_pred = TRUE))
+
+set.seed(674)
+qda_res <- fit_resamples(qda_wf, resamples = cv_folds_red,
+                         metrics = model_metrics,
+                         control = control_resamples(save_pred = TRUE))
+
+collect_metrics(lda_res)
+collect_metrics(qda_res)
+```
+
+```{r lda evaluation}
+final_lda <- lda_wf %>% fit(diabetes_train_red)
+final_qda <-qda_wf %>% fit(diabetes_train_red)
+
+#lda predictions 
+lda_preds <- final_lda %>% 
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+roc_auc(lda_preds, truth = diabetes, .pred_yes, event_level = "second")
+#lda auc 0.93
+
+
+pr_auc(lda_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.595
+
+lda_preds_class <- final_lda %>% 
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(lda_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(lda_preds_class, truth = diabetes, estimate = .pred_class)
+
+sensitivity(lda_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#sensitivity is 0.44
+
+specificity(lda_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#specificity is 0.97
+```
+
+```{r qda evaluation}
+qda_preds <- final_qda %>% 
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+roc_auc(qda_preds, truth = diabetes, .pred_yes, event_level = "second")
+#auc 0.86
+
+pr_auc(qda_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.414
+
+qda_preds_class <- final_qda %>% 
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(qda_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(qda_preds_class, truth = diabetes, estimate = .pred_class)
+#0.834
+
+sensitivity(qda_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.642
+
+specificity(qda_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.856
+```
+## Classification and Regression Tree (CART)
+CART splits the data on the predictor that best reduces class impurity (measured by the Gini index). Each internal node poses a binary yes/no question about a feature value, and each leaf gives the predicted class. CART was included because it is fully interpretable, allowing the resulting tree structure to be inspected directly to understand how predictions are made. The cost complexity parameter (`cp`) and tree depth were tuned through 5-fold CV to prevent overfitting. A larger `cp` prunes the tree more aggressively, trading off some predictive performance for generalizability.
+```{r CART}
+cart_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune()
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+cart_wf <- workflow() %>%
+  add_recipe(reduced_recipe) %>%
+  add_model(cart_spec)
+
+cart_grid <- grid_regular(
+  cost_complexity(range = c(-4, -1)),
+  tree_depth(range = c(3, 12)),
+  levels = c(5, 4)
+)
+
+set.seed(674)
+cart_tuning <- tune_grid(
+  cart_wf,
+  resamples = cv_folds_red,
+  grid = cart_grid,
+  metrics = model_metrics,
+  control = ctrl
+)
+
+autoplot(cart_tuning) + labs(title = "CART tuning")
+best_cart <- select_best(cart_tuning, metric = "roc_auc")
+print(best_cart)
+```
+
+```{r CART test evaluation}
+final_cart <- cart_wf %>%
+  finalize_workflow(best_cart) %>%
+  fit(diabetes_train_red)
+
+final_cart %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20) + labs(title = "CART variable importance")
+
+cart_preds <- final_cart %>% 
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+roc_auc(cart_preds, truth = diabetes, .pred_yes, event_level = "second")
+#auc 0.868
+
+pr_auc(cart_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.489
+
+cart_preds_class <- final_cart %>%
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(cart_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(cart_preds_class, truth = diabetes, estimate = .pred_class)
+#0.902 accuracy
+
+sensitivity(cart_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.363
+
+specificity(cart_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.964
+```
+## Random Forest
+Random Forest builds an ensemble of 500 decision trees, with each trained on a bootstrapped sample of the data. At each split, only a random subset of `mtry` predictors are considered, which decorrelates the trees and reduces overall variance compared to a single tree. Predictions were made by averaging probabilities across all trees. Random Forest was chosen because ensemble methods consistently outperform single trees, where it handles non-linear relationships and interactions automatically and provides meaningful impurity-based variable importance scores. The hyperparameters `mtry` (2–15 predictors per split) and `min_n` (2–30 minimum observations to split a node) were tuned through 5-fold CV.
+```{r Random Forest}
+rf_spec <- rand_forest(
+  trees = 500,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_recipe(reduced_recipe) %>%
+  add_model(rf_spec)
+
+#mtry needs a numeric upper bound = total predictors after preprocessing
+p_predictors <- reduced_recipe %>% prep() %>% bake(new_data = NULL) %>%
+  select(-diabetes) %>% ncol()
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, min(p_predictors, 15))),
+  min_n(range = c(2, 30)),
+  levels = c(4, 4)
+)
+
+set.seed(674)
+rf_tuning <- tune_grid(
+  rf_wf,
+  resamples = cv_folds_red,
+  grid = rf_grid,
+  metrics = model_metrics,
+  control = ctrl
+)
+
+autoplot(rf_tuning) + labs(title = "Random Forest tuning")
+best_rf <- select_best(rf_tuning, metric = "roc_auc")
+print(best_rf)
+```
+
+```{r random forest evaluation on testing data}
+final_rf <- rf_wf %>%
+  finalize_workflow(best_rf) %>%
+  fit(diabetes_train_red)
+
+final_rf %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 20) +
+  labs(title = "Random Forest Variable Importance")
+
+rf_preds <- final_rf %>%
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+roc_auc(rf_preds, truth = diabetes, .pred_yes, event_level = "second")
+#auc is 0.932
+
+pr_auc(rf_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.627
+
+rf_preds_class <- final_rf %>%
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(rf_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(rf_preds_class, truth = diabetes, estimate = .pred_class)
+#0.908
+
+sensitivity(rf_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.128
+
+specificity(rf_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.99
+```
+## XGBoost with Class Weighting
+XGBoost builds trees sequentially, where each new tree corrects the residual errors of the previous ensemble. Over many rounds, this produces a highly accurate combined model. A key setting here was `scale_pos_weight = 8.756`, which tells the model to treat each missed diabetes case as roughly 8.75 times more costly than a missed non-diabetes case. Without this adjustment, XGBoost defaulted to near-zero sensitivity, which essentially predicted "no diabetes" for almost everyone. Two rounds of tuning were run: the first identified that some parameters were near the edges of the search grid, and the second refined the search in a narrower range around those values.
+```{r XGBoost model}
+
+#neg <- sum(diabetes_train_red$diabetes == "no")
+
+#pos <- sum(diabetes_train_red$diabetes == "yes")
+
+xgb_spec <- boost_tree(trees = tune(), 
+                       learn_rate = tune(),
+                       tree_depth = tune(),
+                       min_n = tune()) %>%
+                      set_engine("xgboost", scale_pos_weight = 8.756, event_level = "second") %>% set_mode("classification")
+#the cases are roughly 10% of the total rows, but we can calculate the exact value and this is better for reproducibility.
+
+
+
+#we did some more research and found there is a parameter called scale_pos_weight which can add additional weight to the cases, this would help the model sensitivity. 
+
+#will tune the above parameters, the other tunable parameters are good at the default level
+
+#boosting workflow
+xgb_wf <- workflow() %>% add_recipe(reduced_recipe) %>% add_model(xgb_spec) 
+
+#tuning grid
+#xgb_grid <- grid_regular(trees(range = c(100, 1000)), learn_rate(range = c(-3, -1)), tree_depth(range = c(3, 8)), min_n(range = c(2,20)), levels = 3)
+#tree range was chosen to balance time and pattern recognition. 
+#learn_rate range is a standard range, we want the model to learn slower to avoid overshooting, and a lower learn rate means that each tree contributes less overall to the model. 
+#tree_depth range controls have complex each individual tree is, smaller trees are weaker learners and generally better for boosting models which learn sequentially. 
+#min_n range was chosen to cover the range of observations needed to split a node. 
+
+#set.seed(674)
+
+#xgb_tuning <- tune_grid(xgb_wf, resamples = cv_folds_red, grid = xgb_grid, metrics = model_metrics, control = ctrl)
+
+#autoplot(xgb_tuning) + labs( title = "XGBoost tuning")
+
+#best_xgb <- select_best(xgb_tuning, metric = "roc_auc")
+
+#print(best_xgb)
+
+#Check a second pass to see if there is a better value. 
+
+xgb_grid2 <- grid_regular(trees(range = c(50, 300)),           learn_rate(range = c(-2, 0)), tree_depth(range = c(2, 5)), min_n( range = c(5, 20)), levels = 3)
+
+set.seed(674)
+xgb_tuning2 <- tune_grid(xgb_wf, resamples = cv_folds_red, grid = xgb_grid2, metrics = model_metrics, control = ctrl) 
+
+autoplot(xgb_tuning2) + labs(title = "XGBoost Tune 2, return of the tune")
+
+best_xgb2 <- select_best(xgb_tuning2, metric = "roc_auc")
+
+print(best_xgb2)
+#there were slight differences in the tuning parameters this time. the trees is now in the middle of the range, we can be more confident in this.
+#the learn_rate remained 0.1
+#the other parameters changed slightly. will use the result from the second tune in the final wf
+
+final_xgb <- xgb_wf %>% finalize_workflow(best_xgb2) %>% fit(diabetes_train_red)
+ 
+final_xgb %>% 
+  extract_fit_parsnip() %>%
+  vip(num_features = 20) + labs(title = "XGBoost variable importance")
+
+#test on the testing data
+xgb_preds <- final_xgb %>% 
+  predict(diabetes_test_red, type = "prob") %>%
+  bind_cols(diabetes_test_red %>%
+  select(diabetes))
+
+roc_auc(xgb_preds, truth = diabetes, .pred_yes, event_level = "second")
+#0.93 includes true negatives in calculation, there are many true negatves hence the performance is very high. 
+
+pr_auc(xgb_preds, truth = diabetes, .pred_yes, event_level = "second")
+#pr auc includes true positives in claculation, this measure is more conservative of overall model performance. we should keep both and explain the differences. 
+#0.647
+
+xgb_preds_class <- final_xgb %>%
+  predict(diabetes_test_red) %>%
+  bind_cols(diabetes_test_red %>% select(diabetes))
+
+conf_mat(xgb_preds_class, truth = diabetes, estimate = .pred_class)
+
+accuracy(xgb_preds_class, truth = diabetes, estimate = .pred_class)
+
+sensitivity(xgb_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+#0.866 weighted with 0.144 weights
+#0.899 with 8.756 weights and event level second!
+
+specificity(xgb_preds_class, truth = diabetes, estimate = .pred_class, event_level = "second")
+
+#trouble shooting AUC
+
+levels(diabetes_test_red$diabetes)
+
+head(xgb_preds)
+
+#the issue was that yes, the event is the second level, roc auc by default treats the first level as the event, specifying that second is the event has resolved the issue. 
+#roc_auc(xgb_preds, truth = diabetes, .pred_yes, event_level = "second")
+#much better, need to go back and run the evaluations on the testing data and be sure to change the event level to second
+
+#the boosting model has a high AUC, 0.94 and has nearly perfect specificity, meaning it does very well at predicting people that do not have diabetes, the model is not as strong at predicting people that do have diabetes, largely due to the small sample size of cases. 
+```
+# Model Performance and Evaluation
+## Summary Table
+The table below shows test set performance for all seven models. Cross-validation ROC-AUC values serve as the training-side performance reference, since they reflect how each model performed on held-out portions of the training data during tuning.
+
+All models achieved ROC-AUC values between 0.86 and 0.94, which looks good but ROC-AUC can be misleading when one class is rare. With 90% of participants not having diabetes, a model that simply predicts "no" for everyone would still have many true negatives, inflating its ROC-AUC. PR-AUC is stricter as it focuses only on how well the model identifies the positive (diabetic) class, and a random guesser would score only ~10% (the prevalence). Scores of 0.41–0.66 therefore represent a meaningful improvement above chance. For a diabetes screening tool, sensitivity is the share of actual diabetes cases correctly caught which is the most clinically important metric, since a missed diagnosis carries greater risk. 
+```{r extract the model metrics from each model}
+library(gt)
+
+model_summary <- tibble(
+  Model = c("LASSO", "XGBoost (weighted)", "LDA", "QDA", "Random Forest", "CART", "KNN"), 
+  ROC_AUC = c(0.9376, 0.9369, 0.9299, 0.9314, 0.8681, 0.8851, 0.8629),
+  PR_AUC = c(0.6606, 0.6476, 0.5952, 0.6268, 0.4886, 0.4561, 0.4143),
+  Sensitivity = c(0.3687, 0.8994, 0.4469, 0.1229, 0.3631, 0.0335, 0.6425),
+  Specificity = c(0.9866, 0.8235, 0.9693, 0.9968, 0.9642, 0.9981, 0.8561),
+  Accuracy = c(0.9231, 0.8313, 0.9157, 0.9071, 0.9024, 0.8990, 0.8342)
+)
+
+model_summary %>%
+  gt() %>%
+  tab_header(title = "Model Performance Comparison") %>%
+  fmt_number(columns = where(is.numeric), decimals = 3) %>%
+  data_color(
+    columns = c(ROC_AUC, PR_AUC, Sensitivity, Specificity, Accuracy),
+    palette = "Blues"
+  )
+
+```
+
+# Empirical Results and Interpretation
+
+## ROC Curves
+The ROC curves below show each model's ability to distinguish diabetic from non-diabetic participants across all possible classification thresholds. All models curve well above the diagonal line. LASSO and XGBoost sit at the top. The curves are bunched closely together, which is why looking at PR-AUC and sensitivity separately is important for telling these models apart.
+```{r roc curves for all models}
+library(pROC)
+all_roc <- bind_rows(
+  lasso_preds %>% mutate(model = "LASSO"),
+  xgb_preds %>% mutate(model = "XGBoost (weighted)"),
+  lda_preds %>% mutate(model = "LDA"),
+  qda_preds %>% mutate(model = "QDA"),
+  knn_preds %>% mutate(model = "KNN"),
+  cart_preds %>% mutate(model = "CART"),
+  rf_preds %>% mutate(model = "Random Forest")
+)
+
+all_roc %>% group_by(model) %>%
+  roc_curve(truth = diabetes, .pred_yes, event_level = "second") %>%
+  autoplot() +
+  labs(title = "ROC Curves for All Models",
+       subtitle = "Dashed line represents random classifier",
+       color = "Model") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    legend.key.width = unit(1.5, "cm"),
+    legend.title = element_text(size = 11)
+  ) +
+  scale_color_manual(values = c(
+    "CART" = "#E41A1C",
+    "KNN" = "#FF7F00",
+    "LASSO" = "#4DAF4A",
+    "LDA" = "#377EB8",
+    "QDA" = "#00CED1",
+    "Random Forest" = "#984EA3",
+    "XGBoost (weighted)" = "#FF69B4"
+  ))
+```
+
+## Precision-Recall Curves
+Precision-recall curves focus only on how well each model identifies diabetic participants, making them a more honest evaluation under class imbalance. The dashed horizontal line at 0.10 represents a random classifier. LASSO maintains the highest precision at intermediate recall levels. XGBoost trades some precision for much higher recall, which catch more diabetes cases at the cost of more false positives. QDA's curve drops off steeply, reflecting its very low default-threshold sensitivity.
+```{r pr_auc curve for all models}
+print(pr_auc(qda_preds, truth = diabetes, .pred_yes, event_level = "second"))
+
+all_roc %>%
+  group_by(model) %>%
+  pr_curve(truth = diabetes, .pred_yes, event_level = "second") %>%
+  autoplot() +
+  labs(title = "PR AUC Curves for All Models",
+       subtitle = "Horizontal dashed line represents random classifier (prevalence = 10%)",
+       color = "Model") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    legend.key.width = unit(1.5, "cm"),
+    legend.title = element_text(size = 11)
+  ) +
+  scale_color_manual(values = c(
+    "CART" = "#E41A1C",
+    "KNN" = "#FF7F00",
+    "LASSO" = "#4DAF4A",
+    "LDA" = "#377EB8",
+    "QDA" = "#00CED1",
+    "Random Forest" = "#984EA3",
+    "XGBoost (weighted)" = "#FF69B4"
+  ))
+```
+## Sensitivity Comparison
+This chart makes the gap between models clear. XGBoost correctly identified nearly 90% of diabetic participants, which is far ahead of every other model. LASSO had the best ROC-AUC but only caught 37% of true cases at the default threshold. CART caught fewer than 4%, essentially predicting "no diabetes" for almost every participant. This illustrates why ROC-AUC alone is not sufficient for evaluating models on imbalanced data.
+```{r sensitivity bar plot}
+model_summary %>%
+  ggplot(aes(x = reorder(Model, Sensitivity), 
+             y = Sensitivity, 
+             fill = Model)) +
+  geom_col() +
+  geom_text(aes(label = round(Sensitivity, 3)), 
+            hjust = -0.15, size = 4) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "CART" = "red",
+    "KNN" = "orange",
+    "LASSO" = "green",
+    "LDA" = "cyan",
+    "QDA" = "blue",
+    "Random Forest" = "purple",
+    "XGBoost (weighted)" = "pink"
+  )) +
+  labs(title = "Sensitivity Comparison Across Models",
+       subtitle = "Higher values indicate better detection of true diabetes cases\n*XGBoost sensitivity reflects scale_pos_weight = 8.76; not directly comparable",
+       x = NULL, y = "Sensitivity") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "none",
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylim(0, 1.08)
+```
+## CV vs. Test ROC-AUC (Overfitting Check)
+The table below compares each model's cross-validation ROC-AUC (measured during training) to its test set ROC-AUC (measured on unseen data). A large positive gap could indicate that the model happened to perform unusually well on the test set by chance; a large negative gap would indicate overfitting. All gaps are small (under 0.03) except QDA, which showed an unusually large jump of +0.08, which was likely because QDA's CV performance was less stable due to the small number of positive cases within each fold. XGBoost's CV score is not directly comparable to the others because it was computed with class weighting active.
+```{r Overfitting checks}
+collect_metrics(lasso_tuning) %>% filter(.metric == "roc_auc") %>% 
+  slice_max(mean, n=1)
+collect_metrics(knn_tuning) %>% filter(.metric == "roc_auc") %>% 
+  slice_max(mean, n=1)
+collect_metrics(lda_res) %>% filter(.metric == "roc_auc")
+collect_metrics(qda_res) %>% filter(.metric == "roc_auc")
+collect_metrics(cart_tuning) %>% filter(.metric == "roc_auc") %>% 
+  slice_max(mean, n=1)
+collect_metrics(rf_tuning) %>% filter(.metric == "roc_auc") %>% 
+  slice_max(mean, n=1)
+collect_metrics(xgb_tuning2) %>% filter(.metric == "roc_auc") %>% 
+  slice_max(mean, n=1)
+
+
+model_summary_full <- tibble(
+  Model = c("LASSO", "KNN", "LDA", "QDA", "CART", "Random Forest", "XGBoost (weighted)"),
+  CV_ROC_AUC = c(0.9134, 0.8672, 0.9037, 0.8495, 0.8566, 0.9074, 0.9099),
+  Test_ROC_AUC = c(0.9376, 0.8629, 0.9299, 0.9314, 0.8851, 0.9314, 0.9369),
+  Overfit_Gap = round(Test_ROC_AUC - CV_ROC_AUC, 4)
+) 
+
+model_summary <- tibble(
+  Model = c("LASSO", "XGBoost (weighted)", "LDA", "QDA", "Random Forest", "CART", "KNN"), 
+  ROC_AUC = c(0.9376, 0.9369, 0.9299, 0.9314, 0.9314, 0.8851, 0.8629),
+  PR_AUC = c(0.6606, 0.6476, 0.5952, 0.6268, 0.6270, 0.4561, 0.4143),
+  Sensitivity = c(0.3687, 0.8994, 0.4469, 0.1229, 0.3631, 0.0335, 0.6425),
+  Specificity = c(0.9866, 0.8235, 0.9693, 0.9968, 0.9642, 0.9981, 0.8561),
+  Accuracy = c(0.9231, 0.8313, 0.9157, 0.9071, 0.9024, 0.8990, 0.8342)
+)
+model_summary_full %>%
+  gt() %>%
+  tab_header(
+    title = "CV vs Test ROC-AUC by Model",
+    subtitle = "Positive gap = test outperformed CV (no overfitting concern)"
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  data_color(
+    columns = Overfit_Gap,
+    palette = "RdYlGn",
+    reverse = TRUE
+  ) %>%
+  tab_footnote(
+    footnote = "QDA gap of +0.082 is unusually large and should be interpreted with caution. XGBoost CV AUC was computed with scale_pos_weight active and is not directly comparable to other models.",
+    locations = cells_column_labels(columns = Overfit_Gap)
+  )
+```
+## Confusion Matrices
+The confusion matrices below translate model probabilities into actual prediction counts for the three most informative models. With approximately 169 true diabetes cases in the test set:
+**XGBoost** correctly identified 152 of 169 diabetic participants but also flagged 275 non-diabetic participants as diabetic (false positives). In a screening context, false positives lead to follow-up testing, which is a much more acceptable error than a missed diagnosis.
+**LASSO** and **QDA** missed roughly 100–148 diabetes cases while correctly classifying almost all non-diabetic participants. These models are better at avoiding false alarms but worse at finding actual cases.
+The right choice between these models depends on the clinical context. The XGBoost is better when the goal is to catch as many cases as possible; LASSO may be preferred when unnecessary follow-up testing is costly.
+
+```{r confusion matrix heatmap}
+library(pheatmap)
+
+plot_conf_pheatmap <- function(preds_class, model_name) {
+  cm <- conf_mat(preds_class, truth = diabetes, estimate = .pred_class)$table
+  
+  pheatmap(cm, display_numbers = TRUE,
+           number_format = "%d",
+           cluster_rows = FALSE,
+           cluster_cols = FALSE,
+           color = colorRampPalette(c("white", "steelblue"))(50),
+           main = paste("Confusion Matrix", model_name),
+           angle_col = 0)
+}
+
+plot_conf_pheatmap(xgb_preds_class,"XGBoost (weighted")
+plot_conf_pheatmap(lasso_preds_class, "LASSO")
+plot_conf_pheatmap(qda_preds_class, "QDA")
+
+plot_conf_pheatmap <- function(preds_class, model_name) {
+  cm <- conf_mat(preds_class, truth = diabetes, estimate = .pred_class)$table
+  
+  # Normalize by row (actual class)
+  cm_prop <- sweep(cm, 2, colSums(cm), "/")
+  
+  pheatmap(cm_prop,
+           display_numbers = TRUE,
+           number_format = "%.2f",
+           cluster_rows = FALSE,
+           cluster_cols = FALSE,
+           color = colorRampPalette(c("white", "steelblue"))(50),
+           main = paste("Confusion Matrix -", model_name),
+           angle_col = 0)
+}
+
+plot_conf_pheatmap(xgb_preds_class,"XGBoost (weighted")
+plot_conf_pheatmap(lasso_preds_class, "LASSO")
+plot_conf_pheatmap(qda_preds_class, "QDA")
+
+```
+## Variable Importance Across Models
+
+The plots below show the top predictors from LASSO, Random Forest, and XGBoost. Age, BMI, triglycerides, HDL cholesterol, family history of diabetes, and high blood pressure history appear consistently across all three models. The PHQ-9 depression score and poverty-income ratio also appear, reflecting the known links between depression, socioeconomic disadvantage, and diabetes risk. The fact that different model types agree on the same predictors strengthens confidence that these variables carry real signal.
+```{identify top 10 predictors, rename only these}
+library(vip)
+vip(lm(mpg~., data = mtcars))
+```
+
+# Conclusion and Future Work
+
+## Summary of Findings
+
+This project demonstrated that machine learning models trained on NHANES 2017–2018 survey and examination data can accurately classify Type 2 diabetes, with ROC-AUC values of 0.86–0.94 across all seven models. The central methodological challenge was the approximately 10% class prevalence, which caused standard models to default to near-zero sensitivity, essentially predicting that nobody has diabetes and still achieving 90% accuracy.
+The key findings are:
+**Best overall discriminator (ROC-AUC and PR-AUC):** LASSO logistic regression (ROC-AUC = 0.938, PR-AUC = 0.661). LASSO also served as the feature selection tool, reducing 55+ predictors to approximately 20 non-zero variables.
+**Best clinical screening model (sensitivity):** XGBoost with `scale_pos_weight = 8.756` (sensitivity = 0.899). This model correctly identified nearly 9 out of 10 diabetic participants at the default classification threshold, at a trade-off of lower specificity (0.824) and more false positives.
+**Class imbalance is the dominant challenge.** Without explicit intervention (class weighting or threshold adjustment), all models produced near-zero sensitivity. XGBoost's `scale_pos_weight` parameter was the most effective single intervention tested.
+**Top predictors across models:** Age, BMI, triglycerides, HDL cholesterol, family history of diabetes, and history of high blood pressure — all consistent with established T2D clinical risk factors and the findings of published epidemiological literature.
+**MICE imputation** allowed the analysis to retain a richer feature set than a complete-case analysis would have permitted, including the clinically important but partially missing lipid variables.
+
+## Limitations
+Several limitations should be considered when interpreting these results:
+**Cross-sectional design:** NHANES 2017–2018 is a single-time-point survey. The models predict prevalent, diagnosed diabetes — not incident diabetes — and no causal inference is possible.
+**Self-reported outcome:** Diabetes status (DIQ010) is based on participant recall of a physician diagnosis. Undiagnosed diabetes cases are coded as "no," creating systematic outcome misclassification that likely underestimates true sensitivity.
+**Missingness assumptions:** MICE assumes the data are Missing at Random (MAR). This was supported empirically for the three tested variables, but MNAR cannot be fully ruled out, particularly for lipid values tied to fasting status.
+**Threshold uniformity:** Only XGBoost explicitly addressed class imbalance through class weighting. The remaining six models were evaluated at the default 0.5 probability threshold. Applying consistent threshold tuning or class weighting across all models would enable a fairer sensitivity comparison.
+*Feature selection stability:** LASSO feature selection was performed on a single imputed dataset. Results may differ across the five imputed datasets or with a different cross-validation seed.
+**Generalizability:** Results reflect the U.S. general population as represented by NHANES. Performance may differ in other countries, clinical settings, or non-representative samples.
+**Little's Test** There is a statistical test called Little's test which is a statistical procedure used to determine if multivariate data is MCAR. The test tests the null hypothesis that the data is MCAR by comparing observed mean values across different missing data patterns to the overall mean. A Significant p value would mean that the data is not MCAR. This test is more precise than the logistic regression approach for testing MCAR assumption.
+**SIS** There is a package called Sure Independence Screening (SIS) this is a better approach than using LASSO to decide on the predictors for the rest of the models because LASSO applies a penalty based on linear relationships with the outcome. If there are non linear relationships between variables and outcomes then they are removed by LASSO and then never seen by non linear models like random forest and XGBoost. 
+**Increase number of trees** The number of trees in the random forest and XGBoost models could be increased, this would likely improve performance
+**Threshold tuning** Threshold for classification could be tuned rather than the default 0.5
+
+## Future Work
+Future researchers could improve upon or expand this work by:
+1. **Apply uniform threshold tuning** across all seven models to enable a fair apples-to-apples sensitivity comparison, rather than reporting only the default-threshold metrics for six of seven models.
+2. **Explore SMOTE or other oversampling techniques** as an alternative or complement to class weighting for handling the imbalanced outcome.
+3. **Pool across all five MICE imputed datasets** rather than using only the first, which would produce more stable coefficient and importance estimates.
+4. **Extend to prospective prediction** using longitudinal NHANES linkage data or combining multiple survey cycles to predict incident diabetes rather than prevalent diagnosed diabetes.
+5. **Apply in a clinical validation setting** with a separate external dataset to assess whether performance holds outside the NHANES sampling frame.
+6. **Compare model to other years data** The models performed well on testing set after tuning, to truly evaluate the performance we could test on other years.
